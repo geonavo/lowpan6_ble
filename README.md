@@ -4,14 +4,19 @@ This component provides a custom ESP-NETIF layer for
 [RFC7668](https://datatracker.ietf.org/doc/html/rfc7668), allowing devices to
 transport IPv6 over Bluetooth Low Energy links.
 
-> :warning: This is still an experimental library -- use at your own risk.
+> :warning: This is an experimental library, developed for a pretty narrow
+> use-case. In particular, we just needed to connect to a peripheral using
+> LoWPAN6 for local communications so have not really tested this component as
+> a LoWPAN6 client. This component does not implement any routing capabilities:
+> this won't allow you to route packets from your personal area network to the
+> public internet, for example.
 
 ## Usage
 
 This component only supports the NimBLE stack. It also requires support for
 L2CAP COC connections. This means your project's `sdkconfig` needs at least:
 * NimBLE as the Bluetooth stack (`CONFIG_BT_NIMBLE_ENABLED=y`)
-* `CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM` as a Non-zero value
+* `CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM` set to a non-zero value
 
 There is some boilerplate required to set up this netif layer.
 ```c
