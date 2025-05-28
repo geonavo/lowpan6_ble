@@ -244,9 +244,10 @@ static int on_gap_event(struct ble_gap_event* event, void* arg)
     switch (event->type)
     {
     case BLE_GAP_EVENT_CONNECT:
-        rc                            = on_gap_event_connect(driver, event);
-        out_event.type                = LOWPAN6_BLE_EVENT_GAP_CONNECTED;
-        out_event.gap_connected.event = event;
+        rc                                           = on_gap_event_connect(driver, event);
+        out_event.type                               = LOWPAN6_BLE_EVENT_GAP_CONNECTED;
+        out_event.gap_connected.event                = event;
+        out_event.gap_connected.lowpan6_ble_upgrade_status = rc;
         user_notify(driver, &out_event);
         return rc;
 

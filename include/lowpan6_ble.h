@@ -119,6 +119,13 @@ struct lowpan6_ble_event
         {
             //! The underlying GAP event.
             struct ble_gap_event* event;
+
+            /** The status code for our l6ble upgrade process.
+             *
+             * Set to 0 on success, BLE host error code if there was a failure
+             * in establishing the GAP or L2CAP connection.
+             */
+            int lowpan6_ble_upgrade_status;
         } gap_connected;
 
         //! Data available for type LOWPAN6_BLE_EVENT_GAP_DISCONNECTED.
