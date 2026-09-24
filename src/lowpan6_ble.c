@@ -49,7 +49,21 @@ static struct os_mempool s_mempool;
 //! Memory allocated for our memory pool, above.
 static os_membuf_t s_membuf[MBUF_MEMPOOL_SIZE];
 
+//! Set when NimBLE reports that a stalled L2CAP transmission has completed.
 #define BIT_TX_UNSTALLED (1 << 0)
+
+//! Set when the L2CAP channel disconnects; cleared when a new channel connects.
+#define BIT_CHAN_DISCONNECTED (1 << 1)
+
+/** The maximum time to wait for a stalled L2CAP transmission to complete before dropping a packet.
+ *
+ * `lowpan6_ble_transmit` runs on the lwIP tcpip thread, which _every_ socket in the system (WiFi
+ * included) depends on, so it must never block indefinitely. Dropping a packet is fine: upper
+ * layers (TCP, TFTP, etc.) already handle packet loss.
+ */
+#ifndef LOWPAN6_BLE_TX_UNSTALL_TIMEOUT_MS
+    #define LOWPAN6_BLE_TX_UNSTALL_TIMEOUT_MS 3000
+#endif
 static StaticEventGroup_t s_lowpan6_event_group_buffer;
 static EventGroupHandle_t s_lowpan6_event_group;
 
@@ -101,6 +115,8 @@ static int on_l2cap_event(struct ble_l2cap_event* event, void* arg)
     switch (event->type)
     {
     case BLE_L2CAP_EVENT_COC_CONNECTED:
+        // Clear any state left over from a previous channel so it can't wake a new transmitter
+        xEventGroupClearBits(s_lowpan6_event_group, BIT_TX_UNSTALLED | BIT_CHAN_DISCONNECTED);
         driver->conn_handle = event->connect.conn_handle;
         driver->chan        = event->connect.chan;
         struct ble_gap_conn_desc desc;
@@ -122,6 +138,8 @@ static int on_l2cap_event(struct ble_l2cap_event* event, void* arg)
     case BLE_L2CAP_EVENT_COC_DISCONNECTED:
         driver->conn_handle = BLE_HS_CONN_HANDLE_NONE;
         driver->chan        = NULL;
+        // A stalled transmission will never be unstalled now -- wake anyone waiting on it.
+        xEventGroupSetBits(s_lowpan6_event_group, BIT_CHAN_DISCONNECTED);
         lowpan6_ble_netif_down(driver->base.netif);
         break;
 
@@ -252,6 +270,9 @@ static int on_gap_event(struct ble_gap_event* event, void* arg)
         return rc;
 
     case BLE_GAP_EVENT_DISCONNECT:
+        // Backstop for BLE_L2CAP_EVENT_COC_DISCONNECTED: never leave a transmitter waiting on a
+        // link that no longer exists.
+        xEventGroupSetBits(s_lowpan6_event_group, BIT_CHAN_DISCONNECTED);
         rc                               = on_gap_event_disconnect(driver, event);
         out_event.type                   = LOWPAN6_BLE_EVENT_GAP_DISCONNECTED;
         out_event.gap_disconnected.event = event;
@@ -304,20 +325,59 @@ static esp_err_t lowpan6_ble_transmit(void* h, void* buffer, size_t len)
     // If, however, there's already a stalled transmission for some OTHER message, we'll get
     // BLE_HS_EBUSY. In _this_ case, we'll wait for the unstalled event and try again in case the
     // previous operation completed.
+    //
+    // That wait is bounded, and is also woken if the channel disconnects: a stalled transmission is
+    // never unstalled once the link drops, and blocking here forever would hang the lwIP tcpip
+    // thread (and with it, all networking on the device).
     do
     {
+        struct ble_l2cap_chan* chan = driver->chan;
+        if (chan == NULL)
+        {
+            ESP_LOGW(TAG, "(%s) channel closed -- dropping packet; len=%zu", __func__, len);
+            os_mbuf_free_chain(sdu_tx);
+            return ESP_ERR_INVALID_STATE;
+        }
+
         ESP_LOGD(TAG, "(%s) sending; sdu_tx=%p", __func__, sdu_tx);
-        rc = ble_l2cap_send(driver->chan, sdu_tx);
+        rc = ble_l2cap_send(chan, sdu_tx);
         if (rc == BLE_HS_EBUSY)
         {
             ESP_LOGD(TAG, "(%s) waiting for unstall; sdu_tx=%p", __func__, sdu_tx);
-            xEventGroupWaitBits(
+            EventBits_t bits = xEventGroupWaitBits(
                 s_lowpan6_event_group,
-                BIT_TX_UNSTALLED,
-                pdTRUE,
-                pdTRUE,
-                portMAX_DELAY
+                BIT_TX_UNSTALLED | BIT_CHAN_DISCONNECTED,
+                pdFALSE,  // don't clear on exit: BIT_CHAN_DISCONNECTED must stay set
+                pdFALSE,  // wake on either bit
+                pdMS_TO_TICKS(LOWPAN6_BLE_TX_UNSTALL_TIMEOUT_MS)
             );
+
+            if (bits & BIT_CHAN_DISCONNECTED)
+            {
+                ESP_LOGW(
+                    TAG,
+                    "(%s) channel disconnected while waiting for unstall -- dropping packet; "
+                    "len=%zu",
+                    __func__,
+                    len
+                );
+                os_mbuf_free_chain(sdu_tx);
+                return ESP_ERR_INVALID_STATE;
+            }
+            else if (!(bits & BIT_TX_UNSTALLED))
+            {
+                ESP_LOGW(
+                    TAG,
+                    "(%s) timed out waiting for unstall -- dropping packet; len=%zu timeout_ms=%d",
+                    __func__,
+                    len,
+                    LOWPAN6_BLE_TX_UNSTALL_TIMEOUT_MS
+                );
+                os_mbuf_free_chain(sdu_tx);
+                return ESP_ERR_TIMEOUT;
+            }
+
+            xEventGroupClearBits(s_lowpan6_event_group, BIT_TX_UNSTALLED);
         }
         else if (rc != 0 && rc != BLE_HS_ESTALLED)
         {
